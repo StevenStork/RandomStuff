@@ -1,0 +1,44 @@
+C1 Recalculation Framework - Installation
+=========================================
+
+Goal
+----
+Run custom VBA when the formula in C1 recalculates, affecting only the sheet
+where C1's calculated value actually changed.
+
+How it works
+------------
+1. Excel fires Worksheet_Calculate after a sheet recalculates.
+2. The framework reads C1.Value2 and compares it to a per-sheet snapshot.
+3. If C1 did not change, nothing runs.
+4. If C1 changed, ProcessC1Change runs for that sheet only.
+
+Recommended setup (centralized, multiple sheets)
+------------------------------------------------
+1. Save workbook as .xlsm (macro-enabled).
+2. Alt+F11 to open the VBA editor.
+3. Import these files:
+   - modC1RecalcCore.bas
+   - modC1Bootstrap.bas
+   - clsSheetC1Handler.cls
+4. Paste ThisWorkbook.cls contents into the ThisWorkbook module.
+5. Put your logic in modC1RecalcCore.ProcessC1Change.
+6. Optionally edit ShouldMonitorSheet to skip sheets like Config or ReadMe.
+7. Close and reopen the workbook (or run InitializeC1Handlers from Immediate window).
+
+Alternative setup (copy into each sheet)
+----------------------------------------
+1. Import modC1RecalcCore.bas only.
+2. Copy WorksheetModuleTemplate.bas into each target sheet's code module.
+3. Put your logic in ProcessC1Change.
+
+Important notes
+---------------
+- Use Value2 comparisons so number formatting does not cause false triggers.
+- ProcessC1Change should avoid editing C1 or its direct precedents unless
+  you intend to recurse; EnableEvents is toggled, but dependency loops are
+  still possible.
+- If you bulk-load data with macros, call RefreshAllC1Snapshots afterward to
+  avoid treating the load as a user-driven C1 change.
+- Worksheet_Calculate runs for any calculation on that sheet; the snapshot
+  filter ensures only real C1 value changes invoke your code.
