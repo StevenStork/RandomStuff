@@ -1,0 +1,52 @@
+Sheet Rename Monitor - Installation
+====================================
+
+Goal
+----
+Call a predefined macro with the new sheet name whenever a worksheet or chart
+sheet is renamed.
+
+Why workbook events?
+--------------------
+Excel VBA does not expose a SheetRenamed event. This monitor keeps a snapshot
+of each sheet's CodeName -> Name mapping. CodeName never changes when a user
+renames a tab, so a Name mismatch means a rename occurred.
+
+Setup
+-----
+1. Save the workbook as .xlsm.
+2. Alt+F11 to open the VBA editor.
+3. Import modSheetRenameMonitor.bas.
+4. Paste ThisWorkbook.cls into the ThisWorkbook module.
+5. Edit OnSheetNameChanged in modSheetRenameMonitor.bas (or point
+   SHEET_RENAME_MACRO at your own Public Sub).
+
+Predefined macro contract
+-------------------------
+Public Sub OnSheetNameChanged(ByVal sheetName As String)
+
+    sheetName is the tab name AFTER the rename.
+
+To use a different macro name, change:
+
+    Public Const SHEET_RENAME_MACRO As String = "OnSheetNameChanged"
+
+Your replacement macro must be Public, live in a standard module, and accept
+at least one String argument.
+
+When detection runs
+-------------------
+CheckForSheetRenames runs on:
+  - Workbook_SheetActivate
+  - Workbook_SheetDeactivate
+  - Workbook_SheetSelectionChange
+
+That covers the common rename flows. If a user renames a tab and does not
+trigger any of those events before saving, run CheckForSheetRenames manually
+or add another workbook event your workflow already fires (for example
+Workbook_BeforeSave).
+
+Combining with the C1 recalc framework
+--------------------------------------
+Merge the Workbook_Open / NewSheet / BeforeClose handlers from both
+ThisWorkbook.cls files into a single ThisWorkbook module.
