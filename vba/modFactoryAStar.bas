@@ -23,20 +23,30 @@ Option Explicit
 '
 ' Run:
 '   CalculateStationDistances
+'   total = RecalculateStationDistances(writeMatrix:=False)  ' for optimizers
 '==============================================================================
 
 ' --- Sheet / column layout (edit if your workbook differs) -------------------
-Private Const STATIONS_SHEET As String = "Stations"
-Private Const DISTANCES_SHEET As String = "Distances"
+Public Const STATIONS_SHEET As String = "Stations"
+Public Const DISTANCES_SHEET As String = "Distances"
+Public Const STATIONS_DATA_START_ROW As Long = 2
+Public Const STATIONS_COL_NAME As Long = 1
+Public Const STATIONS_COL_BOTTOM_X As Long = 2
+Public Const STATIONS_COL_BOTTOM_Y As Long = 3
+Public Const STATIONS_COL_TOP_X As Long = 4
+Public Const STATIONS_COL_TOP_Y As Long = 5
+Public Const STATIONS_COL_OP_X As Long = 6
+Public Const STATIONS_COL_OP_Y As Long = 7
+
 Private Const HEADER_ROW As Long = 1
-Private Const DATA_START_ROW As Long = 2
-Private Const COL_NAME As Long = 1
-Private Const COL_BOTTOM_X As Long = 2
-Private Const COL_BOTTOM_Y As Long = 3
-Private Const COL_TOP_X As Long = 4
-Private Const COL_TOP_Y As Long = 5
-Private Const COL_OP_X As Long = 6
-Private Const COL_OP_Y As Long = 7
+Private Const DATA_START_ROW As Long = STATIONS_DATA_START_ROW
+Private Const COL_NAME As Long = STATIONS_COL_NAME
+Private Const COL_BOTTOM_X As Long = STATIONS_COL_BOTTOM_X
+Private Const COL_BOTTOM_Y As Long = STATIONS_COL_BOTTOM_Y
+Private Const COL_TOP_X As Long = STATIONS_COL_TOP_X
+Private Const COL_TOP_Y As Long = STATIONS_COL_TOP_Y
+Private Const COL_OP_X As Long = STATIONS_COL_OP_X
+Private Const COL_OP_Y As Long = STATIONS_COL_OP_Y
 
 ' --- Grid / movement settings -----------------------------------------------
 ' One grid cell = this many coordinate units. Smaller = more accurate, slower.
@@ -45,6 +55,10 @@ Private Const CELL_SIZE As Double = 1#
 Private Const BOUND_PADDING As Double = 2#
 ' True = 8-way movement (diagonals cost Sqrt(2)); False = 4-way only.
 Private Const ALLOW_DIAGONALS As Boolean = True
+
+' Optional fixed floor size for pathfinding (0 = derive from station extents).
+Public FloorBoundMaxX As Double
+Public FloorBoundMaxY As Double
 
 Private Type StationRec
     Name As String
@@ -62,9 +76,21 @@ Private Type GridPoint
 End Type
 
 '------------------------------------------------------------------------------
-' Public entry point
+' Public entry points
 '------------------------------------------------------------------------------
 Public Sub CalculateStationDistances()
+    Dim total As Double
+    total = RecalculateStationDistances(True, True)
+End Sub
+
+' Recalculates A* distances for the current Stations sheet layout.
+' Returns the sum of pairwise operator travel distances.
+' Returns -1 if any pair is unreachable or the run fails.
+' Set writeMatrix:=False when calling from an optimizer loop.
+Public Function RecalculateStationDistances( _
+    Optional ByVal writeMatrix As Boolean = True, _
+    Optional ByVal showErrors As Boolean = True) As Double
+
     Dim stations() As StationRec
     Dim stationCount As Long
     Dim blocked() As Boolean
@@ -77,14 +103,18 @@ Public Sub CalculateStationDistances()
     Dim i As Long
     Dim j As Long
     Dim pathLen As Double
+    Dim total As Double
     Dim wsOut As Worksheet
+    Dim errNum As Long
+    Dim errDesc As String
 
+    RecalculateStationDistances = -1
     OptimizeExcel True
     On Error GoTo CleanUp
 
     stationCount = ReadStations(stations)
     If stationCount < 2 Then
-        Err.Raise vbObjectError + 1, "CalculateStationDistances", _
+        Err.Raise vbObjectError + 1, "RecalculateStationDistances", _
             "Need at least 2 stations with complete Bottom/Top/Op coordinates on '" & STATIONS_SHEET & "'."
     End If
 
@@ -92,6 +122,7 @@ Public Sub CalculateStationDistances()
     MapOperatorCells stations, stationCount, blocked, cols, rows, originX, originY, opCells
 
     ReDim distances(1 To stationCount, 1 To stationCount)
+    total = 0
 
     For i = 1 To stationCount
         distances(i, i) = 0
@@ -99,18 +130,32 @@ Public Sub CalculateStationDistances()
             pathLen = AStarDistance(blocked, cols, rows, opCells(i), opCells(j))
             distances(i, j) = pathLen
             distances(j, i) = pathLen
+            If pathLen < 0 Then
+                RecalculateStationDistances = -1
+                GoTo CleanUp
+            End If
+            total = total + pathLen
         Next j
     Next i
 
-    Set wsOut = GetOrCreateSheet(DISTANCES_SHEET)
-    WriteDistanceMatrix wsOut, stations, stationCount, distances
+    If writeMatrix Then
+        Set wsOut = GetOrCreateSheet(DISTANCES_SHEET)
+        WriteDistanceMatrix wsOut, stations, stationCount, distances
+    End If
+
+    RecalculateStationDistances = total
 
 CleanUp:
+    errNum = Err.Number
+    errDesc = Err.Description
     OptimizeExcel False
-    If Err.Number <> 0 Then
-        MsgBox "CalculateStationDistances failed:" & vbCrLf & Err.Description, vbExclamation
+    If errNum <> 0 Then
+        RecalculateStationDistances = -1
+        If showErrors Then
+            MsgBox "RecalculateStationDistances failed:" & vbCrLf & errDesc, vbExclamation
+        End If
     End If
-End Sub
+End Function
 
 '==============================================================================
 ' Input
@@ -202,6 +247,9 @@ Private Sub BuildOccupancyGrid( _
         maxY = MaxD(maxY, stations(i).TopY)
         maxY = MaxD(maxY, stations(i).OpY)
     Next i
+
+    If FloorBoundMaxX > 0 Then maxX = MaxD(maxX, FloorBoundMaxX)
+    If FloorBoundMaxY > 0 Then maxY = MaxD(maxY, FloorBoundMaxY)
 
     maxX = maxX + BOUND_PADDING
     maxY = maxY + BOUND_PADDING
