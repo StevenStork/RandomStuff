@@ -5,8 +5,8 @@ Option Explicit
 ' Factory Station Distance Matrix (A* pathfinding)
 '
 ' Reads machine rectangles and operator stand points from a Stations sheet,
-' treats machines as obstacles on a grid (factory origin at 0,0), then writes
-' the walking distance between every pair of operator points.
+' plus fixed rectangles from an Obstacles sheet. Stations and obstacles both
+' block walking. Obstacles are never moved by the layout optimizer.
 '
 ' Expected input sheet: Stations (headers in row 1)
 '   A: StationName
@@ -16,6 +16,13 @@ Option Explicit
 '   E: TopY
 '   F: OpX
 '   G: OpY
+'
+' Expected input sheet: Obstacles (headers in row 1) — optional
+'   A: ObstacleName
+'   B: BottomX
+'   C: BottomY
+'   D: TopX
+'   E: TopY
 '
 ' Output sheet: Distances
 '   Symmetric matrix of A* path lengths (same units as your coordinates).
@@ -28,6 +35,7 @@ Option Explicit
 
 ' --- Sheet / column layout (edit if your workbook differs) -------------------
 Public Const STATIONS_SHEET As String = "Stations"
+Public Const OBSTACLES_SHEET As String = "Obstacles"
 Public Const DISTANCES_SHEET As String = "Distances"
 Public Const STATIONS_DATA_START_ROW As Long = 2
 Public Const STATIONS_COL_NAME As Long = 1
@@ -37,6 +45,13 @@ Public Const STATIONS_COL_TOP_X As Long = 4
 Public Const STATIONS_COL_TOP_Y As Long = 5
 Public Const STATIONS_COL_OP_X As Long = 6
 Public Const STATIONS_COL_OP_Y As Long = 7
+
+Public Const OBSTACLES_DATA_START_ROW As Long = 2
+Public Const OBSTACLES_COL_NAME As Long = 1
+Public Const OBSTACLES_COL_BOTTOM_X As Long = 2
+Public Const OBSTACLES_COL_BOTTOM_Y As Long = 3
+Public Const OBSTACLES_COL_TOP_X As Long = 4
+Public Const OBSTACLES_COL_TOP_Y As Long = 5
 
 Private Const HEADER_ROW As Long = 1
 Private Const DATA_START_ROW As Long = STATIONS_DATA_START_ROW
@@ -70,6 +85,14 @@ Private Type StationRec
     OpY As Double
 End Type
 
+Private Type ObstacleRec
+    Name As String
+    BottomX As Double
+    BottomY As Double
+    TopX As Double
+    TopY As Double
+End Type
+
 Private Type GridPoint
     X As Long
     Y As Long
@@ -93,6 +116,8 @@ Public Function RecalculateStationDistances( _
 
     Dim stations() As StationRec
     Dim stationCount As Long
+    Dim obstacles() As ObstacleRec
+    Dim obstacleCount As Long
     Dim blocked() As Boolean
     Dim cols As Long
     Dim rows As Long
@@ -118,8 +143,10 @@ Public Function RecalculateStationDistances( _
             "Need at least 2 stations with complete Bottom/Top/Op coordinates on '" & STATIONS_SHEET & "'."
     End If
 
-    BuildOccupancyGrid stations, stationCount, blocked, cols, rows, originX, originY
-    MapOperatorCells stations, stationCount, blocked, cols, rows, originX, originY, opCells
+    obstacleCount = ReadObstacles(obstacles)
+
+    BuildOccupancyGrid stations, stationCount, obstacles, obstacleCount, blocked, cols, rows, originX, originY
+    MapOperatorCells stations, stationCount, obstacles, obstacleCount, blocked, cols, rows, originX, originY, opCells
 
     ReDim distances(1 To stationCount, 1 To stationCount)
     total = 0
@@ -212,6 +239,66 @@ NextRow:
     ReadStations = n
 End Function
 
+' Returns 0 if the Obstacles sheet is missing or empty.
+Private Function ReadObstacles(ByRef obstacles() As ObstacleRec) As Long
+    Dim ws As Worksheet
+    Dim lastRow As Long
+    Dim r As Long
+    Dim n As Long
+    Dim bx As Double
+    Dim by As Double
+    Dim tx As Double
+    Dim ty As Double
+
+    On Error Resume Next
+    Set ws = ThisWorkbook.Worksheets(OBSTACLES_SHEET)
+    On Error GoTo 0
+
+    If ws Is Nothing Then
+        ReadObstacles = 0
+        Exit Function
+    End If
+
+    lastRow = ws.Cells(ws.Rows.Count, OBSTACLES_COL_NAME).End(xlUp).Row
+    If lastRow < OBSTACLES_DATA_START_ROW Then
+        ReadObstacles = 0
+        Exit Function
+    End If
+
+    ReDim obstacles(1 To lastRow - OBSTACLES_DATA_START_ROW + 1)
+    n = 0
+
+    For r = OBSTACLES_DATA_START_ROW To lastRow
+        If IsBlankNumeric(ws.Cells(r, OBSTACLES_COL_BOTTOM_X)) Then GoTo NextRow
+        If IsBlankNumeric(ws.Cells(r, OBSTACLES_COL_BOTTOM_Y)) Then GoTo NextRow
+        If IsBlankNumeric(ws.Cells(r, OBSTACLES_COL_TOP_X)) Then GoTo NextRow
+        If IsBlankNumeric(ws.Cells(r, OBSTACLES_COL_TOP_Y)) Then GoTo NextRow
+
+        n = n + 1
+        bx = CDbl(ws.Cells(r, OBSTACLES_COL_BOTTOM_X).Value2)
+        by = CDbl(ws.Cells(r, OBSTACLES_COL_BOTTOM_Y).Value2)
+        tx = CDbl(ws.Cells(r, OBSTACLES_COL_TOP_X).Value2)
+        ty = CDbl(ws.Cells(r, OBSTACLES_COL_TOP_Y).Value2)
+
+        If Len(Trim$(CStr(ws.Cells(r, OBSTACLES_COL_NAME).Value2))) = 0 Then
+            obstacles(n).Name = "Obstacle" & CStr(n)
+        Else
+            obstacles(n).Name = CStr(ws.Cells(r, OBSTACLES_COL_NAME).Value2)
+        End If
+
+        obstacles(n).BottomX = MinD(bx, tx)
+        obstacles(n).BottomY = MinD(by, ty)
+        obstacles(n).TopX = MaxD(bx, tx)
+        obstacles(n).TopY = MaxD(by, ty)
+NextRow:
+    Next r
+
+    If n > 0 Then
+        ReDim Preserve obstacles(1 To n)
+    End If
+    ReadObstacles = n
+End Function
+
 Private Function IsBlankNumeric(ByVal cell As Range) As Boolean
     IsBlankNumeric = IsEmpty(cell.Value2) Or Len(Trim$(CStr(cell.Value2))) = 0 Or Not IsNumeric(cell.Value2)
 End Function
@@ -222,6 +309,8 @@ End Function
 Private Sub BuildOccupancyGrid( _
     ByRef stations() As StationRec, _
     ByVal stationCount As Long, _
+    ByRef obstacles() As ObstacleRec, _
+    ByVal obstacleCount As Long, _
     ByRef blocked() As Boolean, _
     ByRef cols As Long, _
     ByRef rows As Long, _
@@ -248,6 +337,11 @@ Private Sub BuildOccupancyGrid( _
         maxY = MaxD(maxY, stations(i).OpY)
     Next i
 
+    For i = 1 To obstacleCount
+        maxX = MaxD(maxX, obstacles(i).TopX)
+        maxY = MaxD(maxY, obstacles(i).TopY)
+    Next i
+
     If FloorBoundMaxX > 0 Then maxX = MaxD(maxX, FloorBoundMaxX)
     If FloorBoundMaxY > 0 Then maxY = MaxD(maxY, FloorBoundMaxY)
 
@@ -263,12 +357,13 @@ Private Sub BuildOccupancyGrid( _
         For gy = 0 To rows - 1
             worldX = originX + (CDbl(gx) + 0.5) * CELL_SIZE
             worldY = originY + (CDbl(gy) + 0.5) * CELL_SIZE
-            blocked(gx, gy) = PointInsideAnyMachine(worldX, worldY, stations, stationCount)
+            blocked(gx, gy) = PointInsideAnyStation(worldX, worldY, stations, stationCount) _
+                Or PointInsideAnyObstacle(worldX, worldY, obstacles, obstacleCount)
         Next gy
     Next gx
 End Sub
 
-Private Function PointInsideAnyMachine( _
+Private Function PointInsideAnyStation( _
     ByVal x As Double, _
     ByVal y As Double, _
     ByRef stations() As StationRec, _
@@ -278,16 +373,35 @@ Private Function PointInsideAnyMachine( _
     For i = 1 To stationCount
         If x >= stations(i).BottomX And x <= stations(i).TopX _
            And y >= stations(i).BottomY And y <= stations(i).TopY Then
-            PointInsideAnyMachine = True
+            PointInsideAnyStation = True
             Exit Function
         End If
     Next i
-    PointInsideAnyMachine = False
+    PointInsideAnyStation = False
+End Function
+
+Private Function PointInsideAnyObstacle( _
+    ByVal x As Double, _
+    ByVal y As Double, _
+    ByRef obstacles() As ObstacleRec, _
+    ByVal obstacleCount As Long) As Boolean
+
+    Dim i As Long
+    For i = 1 To obstacleCount
+        If x >= obstacles(i).BottomX And x <= obstacles(i).TopX _
+           And y >= obstacles(i).BottomY And y <= obstacles(i).TopY Then
+            PointInsideAnyObstacle = True
+            Exit Function
+        End If
+    Next i
+    PointInsideAnyObstacle = False
 End Function
 
 Private Sub MapOperatorCells( _
     ByRef stations() As StationRec, _
     ByVal stationCount As Long, _
+    ByRef obstacles() As ObstacleRec, _
+    ByVal obstacleCount As Long, _
     ByRef blocked() As Boolean, _
     ByVal cols As Long, _
     ByVal rows As Long, _
@@ -302,8 +416,10 @@ Private Sub MapOperatorCells( _
 
     For i = 1 To stationCount
         gp = WorldToGrid(stations(i).OpX, stations(i).OpY, originX, originY, cols, rows)
-        ' Operator stand points must remain walkable even if they sit on a machine edge.
-        blocked(gp.X, gp.Y) = False
+        ' Allow standing on a station edge, but never punch a hole through a fixed obstacle.
+        If Not PointInsideAnyObstacle(stations(i).OpX, stations(i).OpY, obstacles, obstacleCount) Then
+            blocked(gp.X, gp.Y) = False
+        End If
         opCells(i) = gp
     Next i
 End Sub
@@ -608,5 +724,19 @@ Public Sub CreateStationsTemplate()
     ws.Cells(1, COL_TOP_Y).Value = "TopY"
     ws.Cells(1, COL_OP_X).Value = "OpX"
     ws.Cells(1, COL_OP_Y).Value = "OpY"
+    ws.Columns.AutoFit
+End Sub
+
+Public Sub CreateObstaclesTemplate()
+    Dim ws As Worksheet
+
+    Set ws = GetOrCreateSheet(OBSTACLES_SHEET)
+    ws.Cells.Clear
+
+    ws.Cells(1, OBSTACLES_COL_NAME).Value = "ObstacleName"
+    ws.Cells(1, OBSTACLES_COL_BOTTOM_X).Value = "BottomX"
+    ws.Cells(1, OBSTACLES_COL_BOTTOM_Y).Value = "BottomY"
+    ws.Cells(1, OBSTACLES_COL_TOP_X).Value = "TopX"
+    ws.Cells(1, OBSTACLES_COL_TOP_Y).Value = "TopY"
     ws.Columns.AutoFit
 End Sub

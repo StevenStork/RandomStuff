@@ -6,7 +6,8 @@ Option Explicit
 '
 ' Moves and rotates stations on the Stations sheet, then calls
 ' RecalculateStationDistances from modFactoryAStar to score the layout.
-' Repeated trials search for a layout that minimizes total operator travel.
+' Fixed blocks on the Obstacles sheet are never moved; layouts that overlap
+' them are rejected, and A* paths route around them.
 '
 ' Manual helpers:
 '   MoveStation "Press1", 2, -1
@@ -43,15 +44,26 @@ Private Type LayoutStation
     SheetRow As Long
 End Type
 
+Private Type FixedObstacle
+    Name As String
+    BottomX As Double
+    BottomY As Double
+    TopX As Double
+    TopY As Double
+End Type
+
 '------------------------------------------------------------------------------
 ' Move a station by (dx, dy). Updates footprint and operator point together.
 '------------------------------------------------------------------------------
 Public Sub MoveStation(ByVal stationName As String, ByVal dx As Double, ByVal dy As Double)
     Dim stations() As LayoutStation
+    Dim obstacles() As FixedObstacle
     Dim n As Long
+    Dim obstacleCount As Long
     Dim idx As Long
 
     n = LoadStations(stations)
+    obstacleCount = LoadObstacles(obstacles)
     idx = FindStationIndex(stations, n, stationName)
     If idx = 0 Then
         MsgBox "Station not found: " & stationName, vbExclamation
@@ -61,6 +73,10 @@ Public Sub MoveStation(ByVal stationName As String, ByVal dx As Double, ByVal dy
     TranslateStation stations(idx), dx, dy
     If Not StationInsideFactory(stations(idx)) Then
         MsgBox "Move would place '" & stationName & "' outside the factory bounds.", vbExclamation
+        Exit Sub
+    End If
+    If StationConflictsWithObstacles(stations(idx), obstacles, obstacleCount) Then
+        MsgBox "Move would overlap a fixed obstacle.", vbExclamation
         Exit Sub
     End If
 
@@ -73,11 +89,14 @@ End Sub
 '------------------------------------------------------------------------------
 Public Sub RotateStation(ByVal stationName As String, ByVal degrees As Long)
     Dim stations() As LayoutStation
+    Dim obstacles() As FixedObstacle
     Dim n As Long
+    Dim obstacleCount As Long
     Dim idx As Long
     Dim steps As Long
 
     n = LoadStations(stations)
+    obstacleCount = LoadObstacles(obstacles)
     idx = FindStationIndex(stations, n, stationName)
     If idx = 0 Then
         MsgBox "Station not found: " & stationName, vbExclamation
@@ -90,6 +109,10 @@ Public Sub RotateStation(ByVal stationName As String, ByVal degrees As Long)
     RotateStationInPlace stations(idx), steps
     If Not StationInsideFactory(stations(idx)) Then
         MsgBox "Rotation would place '" & stationName & "' outside the factory bounds.", vbExclamation
+        Exit Sub
+    End If
+    If StationConflictsWithObstacles(stations(idx), obstacles, obstacleCount) Then
+        MsgBox "Rotation would overlap a fixed obstacle.", vbExclamation
         Exit Sub
     End If
 
@@ -114,7 +137,9 @@ Public Sub OptimizeStationLayout()
     Dim current() As LayoutStation
     Dim candidate() As LayoutStation
     Dim best() As LayoutStation
+    Dim obstacles() As FixedObstacle
     Dim n As Long
+    Dim obstacleCount As Long
     Dim restart As Long
     Dim iter As Long
     Dim currentScore As Double
@@ -140,9 +165,15 @@ Public Sub OptimizeStationLayout()
             "Need at least 2 stations on the Stations sheet."
     End If
 
+    obstacleCount = LoadObstacles(obstacles)
+
     If StationsOverlap(current, n) Then
         Err.Raise vbObjectError + 201, "OptimizeStationLayout", _
             "Starting layout has overlapping machines. Separate them before optimizing."
+    End If
+    If StationsOverlapObstacles(current, n, obstacles, obstacleCount) Then
+        Err.Raise vbObjectError + 204, "OptimizeStationLayout", _
+            "Starting layout overlaps a fixed obstacle. Move stations clear of Obstacles first."
     End If
 
     CopyLayout current, n, best
@@ -166,7 +197,7 @@ Public Sub OptimizeStationLayout()
             CopyLayout current, n, candidate
             MutateLayout candidate, n
 
-            If Not LayoutFeasible(candidate, n) Then GoTo NextIter
+            If Not LayoutFeasible(candidate, n, obstacles, obstacleCount) Then GoTo NextIter
 
             WriteAllStations candidate, n
             candidateScore = RecalculateStationDistances(False, False)
@@ -211,6 +242,7 @@ CleanUp:
                "Starting total travel: " & Format$(startScore, "0.00") & vbCrLf & _
                "Best total travel:     " & Format$(bestScore, "0.00") & vbCrLf & _
                "Improvement:           " & Format$(startScore - bestScore, "0.00") & vbCrLf & _
+               "Fixed obstacles:       " & obstacleCount & vbCrLf & _
                "Candidates evaluated:  " & evaluated & vbCrLf & _
                "Accepted moves:        " & accepted, vbInformation
     End If
@@ -327,11 +359,20 @@ End Function
 '==============================================================================
 ' Feasibility
 '==============================================================================
-Private Function LayoutFeasible(ByRef stations() As LayoutStation, ByVal n As Long) As Boolean
+Private Function LayoutFeasible( _
+    ByRef stations() As LayoutStation, _
+    ByVal n As Long, _
+    ByRef obstacles() As FixedObstacle, _
+    ByVal obstacleCount As Long) As Boolean
+
     Dim i As Long
 
     For i = 1 To n
         If Not StationInsideFactory(stations(i)) Then
+            LayoutFeasible = False
+            Exit Function
+        End If
+        If StationConflictsWithObstacles(stations(i), obstacles, obstacleCount) Then
             LayoutFeasible = False
             Exit Function
         End If
@@ -363,12 +404,59 @@ Private Function StationsOverlap(ByRef stations() As LayoutStation, ByVal n As L
     StationsOverlap = False
 End Function
 
+Private Function StationsOverlapObstacles( _
+    ByRef stations() As LayoutStation, _
+    ByVal n As Long, _
+    ByRef obstacles() As FixedObstacle, _
+    ByVal obstacleCount As Long) As Boolean
+
+    Dim i As Long
+    For i = 1 To n
+        If StationConflictsWithObstacles(stations(i), obstacles, obstacleCount) Then
+            StationsOverlapObstacles = True
+            Exit Function
+        End If
+    Next i
+    StationsOverlapObstacles = False
+End Function
+
+Private Function StationConflictsWithObstacles( _
+    ByRef st As LayoutStation, _
+    ByRef obstacles() As FixedObstacle, _
+    ByVal obstacleCount As Long) As Boolean
+
+    Dim i As Long
+    For i = 1 To obstacleCount
+        If AabbOverlapObstacle(st, obstacles(i), OPT_CLEARANCE) Then
+            StationConflictsWithObstacles = True
+            Exit Function
+        End If
+        If PointInsideObstacle(st.OpX, st.OpY, obstacles(i)) Then
+            StationConflictsWithObstacles = True
+            Exit Function
+        End If
+    Next i
+    StationConflictsWithObstacles = False
+End Function
+
 Private Function AabbOverlap(ByRef a As LayoutStation, ByRef b As LayoutStation, ByVal clearance As Double) As Boolean
     AabbOverlap = Not ( _
         a.TopX + clearance <= b.BottomX Or _
         b.TopX + clearance <= a.BottomX Or _
         a.TopY + clearance <= b.BottomY Or _
         b.TopY + clearance <= a.BottomY)
+End Function
+
+Private Function AabbOverlapObstacle(ByRef st As LayoutStation, ByRef obs As FixedObstacle, ByVal clearance As Double) As Boolean
+    AabbOverlapObstacle = Not ( _
+        st.TopX + clearance <= obs.BottomX Or _
+        obs.TopX + clearance <= st.BottomX Or _
+        st.TopY + clearance <= obs.BottomY Or _
+        obs.TopY + clearance <= st.BottomY)
+End Function
+
+Private Function PointInsideObstacle(ByVal x As Double, ByVal y As Double, ByRef obs As FixedObstacle) As Boolean
+    PointInsideObstacle = (x >= obs.BottomX And x <= obs.TopX And y >= obs.BottomY And y <= obs.TopY)
 End Function
 
 '==============================================================================
@@ -422,6 +510,63 @@ NextRow:
 
     If n > 0 Then ReDim Preserve stations(1 To n)
     LoadStations = n
+End Function
+
+Private Function LoadObstacles(ByRef obstacles() As FixedObstacle) As Long
+    Dim ws As Worksheet
+    Dim lastRow As Long
+    Dim r As Long
+    Dim n As Long
+    Dim bx As Double
+    Dim by As Double
+    Dim tx As Double
+    Dim ty As Double
+
+    On Error Resume Next
+    Set ws = ThisWorkbook.Worksheets(OBSTACLES_SHEET)
+    On Error GoTo 0
+
+    If ws Is Nothing Then
+        LoadObstacles = 0
+        Exit Function
+    End If
+
+    lastRow = ws.Cells(ws.Rows.Count, OBSTACLES_COL_NAME).End(xlUp).Row
+    If lastRow < OBSTACLES_DATA_START_ROW Then
+        LoadObstacles = 0
+        Exit Function
+    End If
+
+    ReDim obstacles(1 To lastRow - OBSTACLES_DATA_START_ROW + 1)
+    n = 0
+
+    For r = OBSTACLES_DATA_START_ROW To lastRow
+        If Not IsNumeric(ws.Cells(r, OBSTACLES_COL_BOTTOM_X).Value2) Then GoTo NextRow
+        If Not IsNumeric(ws.Cells(r, OBSTACLES_COL_BOTTOM_Y).Value2) Then GoTo NextRow
+        If Not IsNumeric(ws.Cells(r, OBSTACLES_COL_TOP_X).Value2) Then GoTo NextRow
+        If Not IsNumeric(ws.Cells(r, OBSTACLES_COL_TOP_Y).Value2) Then GoTo NextRow
+
+        n = n + 1
+        bx = CDbl(ws.Cells(r, OBSTACLES_COL_BOTTOM_X).Value2)
+        by = CDbl(ws.Cells(r, OBSTACLES_COL_BOTTOM_Y).Value2)
+        tx = CDbl(ws.Cells(r, OBSTACLES_COL_TOP_X).Value2)
+        ty = CDbl(ws.Cells(r, OBSTACLES_COL_TOP_Y).Value2)
+
+        If Len(Trim$(CStr(ws.Cells(r, OBSTACLES_COL_NAME).Value2))) = 0 Then
+            obstacles(n).Name = "Obstacle" & CStr(n)
+        Else
+            obstacles(n).Name = CStr(ws.Cells(r, OBSTACLES_COL_NAME).Value2)
+        End If
+
+        obstacles(n).BottomX = MinD(bx, tx)
+        obstacles(n).BottomY = MinD(by, ty)
+        obstacles(n).TopX = MaxD(bx, tx)
+        obstacles(n).TopY = MaxD(by, ty)
+NextRow:
+    Next r
+
+    If n > 0 Then ReDim Preserve obstacles(1 To n)
+    LoadObstacles = n
 End Function
 
 Private Sub WriteStationRow(ByRef st As LayoutStation)
