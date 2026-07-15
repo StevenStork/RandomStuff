@@ -9,6 +9,10 @@ Option Explicit
 ' Fixed blocks on the Obstacles sheet are never moved; layouts that overlap
 ' them are rejected, and A* paths route around them.
 '
+' Each operator stand point must keep OP_BACK_CLEARANCE units clear *behind*
+' it (away from its equipment), free of factory edges, obstacles, and other
+' station footprints.
+'
 ' Manual helpers:
 '   MoveStation "Press1", 2, -1
 '   RotateStation "Press1", 90
@@ -26,6 +30,8 @@ Private Const OPT_RESTARTS As Long = 3
 Private Const OPT_MAX_MOVE As Double = 5#          ' max translation per try
 Private Const OPT_ROTATE_CHANCE As Double = 0.35   ' probability of rotating vs moving
 Private Const OPT_CLEARANCE As Double = 0.5        ' min gap between machines
+Private Const OP_BACK_CLEARANCE As Double = 3#     ' clear depth behind each operator
+Private Const OP_BACK_HALF_WIDTH As Double = 1#    ' half-width of that clearance strip
 Private Const FACTORY_MIN_X As Double = 0#
 Private Const FACTORY_MIN_Y As Double = 0#
 Private Const FACTORY_MAX_X As Double = 100#       ' set to your floor size
@@ -52,6 +58,13 @@ Private Type FixedObstacle
     TopY As Double
 End Type
 
+Private Type ClearRect
+    BottomX As Double
+    BottomY As Double
+    TopX As Double
+    TopY As Double
+End Type
+
 '------------------------------------------------------------------------------
 ' Move a station by (dx, dy). Updates footprint and operator point together.
 '------------------------------------------------------------------------------
@@ -71,12 +84,9 @@ Public Sub MoveStation(ByVal stationName As String, ByVal dx As Double, ByVal dy
     End If
 
     TranslateStation stations(idx), dx, dy
-    If Not StationInsideFactory(stations(idx)) Then
-        MsgBox "Move would place '" & stationName & "' outside the factory bounds.", vbExclamation
-        Exit Sub
-    End If
-    If StationConflictsWithObstacles(stations(idx), obstacles, obstacleCount) Then
-        MsgBox "Move would overlap a fixed obstacle.", vbExclamation
+    If Not LayoutFeasible(stations, n, obstacles, obstacleCount) Then
+        MsgBox "Move would violate factory bounds, obstacle clearance, or the " & _
+               CStr(OP_BACK_CLEARANCE) & "-unit clear space behind an operator.", vbExclamation
         Exit Sub
     End If
 
@@ -107,12 +117,9 @@ Public Sub RotateStation(ByVal stationName As String, ByVal degrees As Long)
     If steps = 0 Then Exit Sub
 
     RotateStationInPlace stations(idx), steps
-    If Not StationInsideFactory(stations(idx)) Then
-        MsgBox "Rotation would place '" & stationName & "' outside the factory bounds.", vbExclamation
-        Exit Sub
-    End If
-    If StationConflictsWithObstacles(stations(idx), obstacles, obstacleCount) Then
-        MsgBox "Rotation would overlap a fixed obstacle.", vbExclamation
+    If Not LayoutFeasible(stations, n, obstacles, obstacleCount) Then
+        MsgBox "Rotation would violate factory bounds, obstacle clearance, or the " & _
+               CStr(OP_BACK_CLEARANCE) & "-unit clear space behind an operator.", vbExclamation
         Exit Sub
     End If
 
@@ -174,6 +181,11 @@ Public Sub OptimizeStationLayout()
     If StationsOverlapObstacles(current, n, obstacles, obstacleCount) Then
         Err.Raise vbObjectError + 204, "OptimizeStationLayout", _
             "Starting layout overlaps a fixed obstacle. Move stations clear of Obstacles first."
+    End If
+    If Not OperatorBackZonesClear(current, n, obstacles, obstacleCount) Then
+        Err.Raise vbObjectError + 205, "OptimizeStationLayout", _
+            "Starting layout needs " & CStr(OP_BACK_CLEARANCE) & _
+            " clear units behind every operator (no walls, obstacles, or other stations)."
     End If
 
     CopyLayout current, n, best
@@ -378,7 +390,12 @@ Private Function LayoutFeasible( _
         End If
     Next i
 
-    LayoutFeasible = Not StationsOverlap(stations, n)
+    If StationsOverlap(stations, n) Then
+        LayoutFeasible = False
+        Exit Function
+    End If
+
+    LayoutFeasible = OperatorBackZonesClear(stations, n, obstacles, obstacleCount)
 End Function
 
 Private Function StationInsideFactory(ByRef st As LayoutStation) As Boolean
@@ -439,6 +456,117 @@ Private Function StationConflictsWithObstacles( _
     StationConflictsWithObstacles = False
 End Function
 
+'------------------------------------------------------------------------------
+' "Behind" = continuing past the operator away from the equipment center.
+' Requires a strip OP_BACK_CLEARANCE deep (and 2*OP_BACK_HALF_WIDTH wide)
+' that stays inside the factory and avoids obstacles / other stations.
+'------------------------------------------------------------------------------
+Private Function OperatorBackZonesClear( _
+    ByRef stations() As LayoutStation, _
+    ByVal n As Long, _
+    ByRef obstacles() As FixedObstacle, _
+    ByVal obstacleCount As Long) As Boolean
+
+    Dim i As Long
+    For i = 1 To n
+        If Not OperatorBackZoneClear(stations(i), i, stations, n, obstacles, obstacleCount) Then
+            OperatorBackZonesClear = False
+            Exit Function
+        End If
+    Next i
+    OperatorBackZonesClear = True
+End Function
+
+Private Function OperatorBackZoneClear( _
+    ByRef st As LayoutStation, _
+    ByVal selfIndex As Long, _
+    ByRef stations() As LayoutStation, _
+    ByVal n As Long, _
+    ByRef obstacles() As FixedObstacle, _
+    ByVal obstacleCount As Long) As Boolean
+
+    Dim box As ClearRect
+    Dim j As Long
+
+    If Not BuildOperatorBackClearance(st, box) Then
+        OperatorBackZoneClear = False
+        Exit Function
+    End If
+
+    ' Entire clearance strip must stay inside the factory floor.
+    If box.BottomX < FACTORY_MIN_X Or box.BottomY < FACTORY_MIN_Y _
+       Or box.TopX > FACTORY_MAX_X Or box.TopY > FACTORY_MAX_Y Then
+        OperatorBackZoneClear = False
+        Exit Function
+    End If
+
+    For j = 1 To obstacleCount
+        If RectsOverlap(box.BottomX, box.BottomY, box.TopX, box.TopY, _
+                obstacles(j).BottomX, obstacles(j).BottomY, obstacles(j).TopX, obstacles(j).TopY, 0#) Then
+            OperatorBackZoneClear = False
+            Exit Function
+        End If
+    Next j
+
+    For j = 1 To n
+        If j <> selfIndex Then
+            If RectsOverlap(box.BottomX, box.BottomY, box.TopX, box.TopY, _
+                    stations(j).BottomX, stations(j).BottomY, stations(j).TopX, stations(j).TopY, 0#) Then
+                OperatorBackZoneClear = False
+                Exit Function
+            End If
+        End If
+    Next j
+
+    OperatorBackZoneClear = True
+End Function
+
+Private Function BuildOperatorBackClearance(ByRef st As LayoutStation, ByRef box As ClearRect) As Boolean
+    Dim cx As Double
+    Dim cy As Double
+    Dim vx As Double
+    Dim vy As Double
+    Dim halfW As Double
+
+    cx = (st.BottomX + st.TopX) / 2#
+    cy = (st.BottomY + st.TopY) / 2#
+    vx = st.OpX - cx
+    vy = st.OpY - cy
+    halfW = OP_BACK_HALF_WIDTH
+
+    ' Prefer the dominant axis (layouts use 90° rotations).
+    If Abs(vx) < 0.0000001 And Abs(vy) < 0.0000001 Then
+        BuildOperatorBackClearance = False
+        Exit Function
+    End If
+
+    If Abs(vx) >= Abs(vy) Then
+        ' Operator is primarily east/west of the machine center.
+        If vx >= 0 Then
+            box.BottomX = st.OpX
+            box.TopX = st.OpX + OP_BACK_CLEARANCE
+        Else
+            box.BottomX = st.OpX - OP_BACK_CLEARANCE
+            box.TopX = st.OpX
+        End If
+        box.BottomY = st.OpY - halfW
+        box.TopY = st.OpY + halfW
+    Else
+        ' Operator is primarily north/south of the machine center.
+        If vy >= 0 Then
+            box.BottomY = st.OpY
+            box.TopY = st.OpY + OP_BACK_CLEARANCE
+        Else
+            box.BottomY = st.OpY - OP_BACK_CLEARANCE
+            box.TopY = st.OpY
+        End If
+        box.BottomX = st.OpX - halfW
+        box.TopX = st.OpX + halfW
+    End If
+
+    BuildOperatorBackClearance = True
+End Function
+
 Private Function AabbOverlap(ByRef a As LayoutStation, ByRef b As LayoutStation, ByVal clearance As Double) As Boolean
     AabbOverlap = Not ( _
         a.TopX + clearance <= b.BottomX Or _
@@ -453,6 +581,18 @@ Private Function AabbOverlapObstacle(ByRef st As LayoutStation, ByRef obs As Fix
         obs.TopX + clearance <= st.BottomX Or _
         st.TopY + clearance <= obs.BottomY Or _
         obs.TopY + clearance <= st.BottomY)
+End Function
+
+Private Function RectsOverlap( _
+    ByVal aBottomX As Double, ByVal aBottomY As Double, ByVal aTopX As Double, ByVal aTopY As Double, _
+    ByVal bBottomX As Double, ByVal bBottomY As Double, ByVal bTopX As Double, ByVal bTopY As Double, _
+    ByVal clearance As Double) As Boolean
+
+    RectsOverlap = Not ( _
+        aTopX + clearance <= bBottomX Or _
+        bTopX + clearance <= aBottomX Or _
+        aTopY + clearance <= bBottomY Or _
+        bTopY + clearance <= aBottomY)
 End Function
 
 Private Function PointInsideObstacle(ByVal x As Double, ByVal y As Double, ByRef obs As FixedObstacle) As Boolean
